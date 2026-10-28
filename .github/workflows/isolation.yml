@@ -1,0 +1,240 @@
+# External verification for airlock-sec/airlock#20, roadmap task 0.8.
+# This is a trusted inline harness, not an implementation of action.yml.
+# Generated shadow modules are data only: never run a non-isolated control.
+name: Isolated Python launch probe
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TRUSTED_SHA: 17079ac7ad830deb2b31e991a84f849ee3074959
+      GITHUB_ACTION_PATH: ${{ github.workspace }}/trusted-airlock
+      PROBE_EVENT: ${{ github.event_name }}
+      PROBE_BASE: ${{ github.event.pull_request.base.sha }}
+    steps:
+      # These exact pins are from the tested Airlock revision's ci.yml.
+      - name: Check out trusted scanner separately
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: airlock-sec/airlock
+          ref: 17079ac7ad830deb2b31e991a84f849ee3074959
+          path: trusted-airlock
+          persist-credentials: false
+          set-safe-directory: false
+
+      - name: Check out scan target with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: scanned
+          fetch-depth: 0
+          persist-credentials: false
+          set-safe-directory: false
+
+      - name: Check out deliberately shallow scan target
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: shallow
+          fetch-depth: 1
+          persist-credentials: false
+          set-safe-directory: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+
+      - name: Record environment and generate benign shadow data
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$GITHUB_ACTION_PATH" rev-parse HEAD)" = "$TRUSTED_SHA"
+          python3 -I - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import platform
+          import sys
+
+          print('UTC=' + datetime.datetime.now(datetime.timezone.utc).isoformat())
+          print('TRUSTED_SHA=' + os.environ['TRUSTED_SHA'])
+          print('PYTHON=' + sys.version)
+          print('EXECUTABLE=' + sys.executable)
+          print('PLATFORM=' + platform.platform())
+          for key in ('RUNNER_OS', 'RUNNER_ARCH', 'ImageOS', 'ImageVersion',
+                      'GITHUB_EVENT_NAME', 'GITHUB_SHA', 'GITHUB_REF'):
+              print(key + '=' + os.environ.get(key, '<unset>'))
+          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          if os.environ['PROBE_EVENT'] == 'pull_request':
+              assert os.environ['PROBE_BASE'] == event['pull_request']['base']['sha']
+              print('REAL_PR_BASE_SHA=' + os.environ['PROBE_BASE'])
+              print('REAL_PR_HEAD_SHA=' + event['pull_request']['head']['sha'])
+              print('PR_NUMBER=' + str(event['number']))
+          workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'isolation-evidence'
+          evidence.mkdir()
+          marker = 'AIRLOCK_' + 'SHADOW_' + 'EXECUTED'
+          sentinel = evidence / 'shadow-executed'
+          source = (
+              'from pathlib import Path\n'
+              + f'print({marker!r}, flush=True)\n'
+              + f'Path({str(sentinel)!r}).touch()\n'
+          )
+          targets = ['scanned']
+          if os.environ['PROBE_EVENT'] == 'pull_request':
+              targets.append('shallow')
+          for name in targets:
+              target = workspace / name
+              # One package shadows cwd lookup; another shadows PYTHONPATH=src.
+              for relative in ('airlock', 'src/airlock'):
+                  package = target / relative
+                  package.mkdir(parents=True, exist_ok=False)
+                  (package / '__init__.py').write_text(source)
+                  (package / 'cli.py').write_text(
+                      source + '\ndef main():\n'
+                      + f'    print({marker!r}, flush=True)\n    return 97\n'
+                  )
+              (target / 'src/sitecustomize.py').write_text(source)
+              (target / 'src/usercustomize.py').write_text(source)
+              print('GENERATED_BENIGN_SHADOWS=' + str(target))
+          assert not sentinel.exists()
+          PY
+          git -C "$GITHUB_WORKSPACE/scanned" add -- airlock src
+          if [[ "$PROBE_EVENT" == pull_request ]]; then
+            git -C "$GITHUB_WORKSPACE/shallow" add -- airlock src
+          fi
+
+      - name: Diagnose isolated imports and run exact full scan sketch
+        working-directory: scanned
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scanned/src:${{ github.workspace }}/scanned
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/isolation-evidence"
+          python3 -I - "$GITHUB_ACTION_PATH/src" <<'PY' > "$evidence/diagnostic.stdout" 2> "$evidence/diagnostic.stderr"
+          import sys
+          sys.path.insert(0, sys.argv.pop(1))
+          import airlock
+          import airlock.cli
+          import os
+          import pathlib
+          import site
+
+          trusted = pathlib.Path(os.environ['GITHUB_ACTION_PATH']).resolve()
+          cwd = pathlib.Path.cwd().resolve()
+          print('CWD=' + str(cwd))
+          print('PYTHONPATH=' + os.environ['PYTHONPATH'])
+          print('AIRLOCK_ORIGIN=' + str(airlock.__file__))
+          print('CLI_ORIGIN=' + str(airlock.cli.__file__))
+          print('SYS_PATH=' + repr(sys.path))
+          print('FLAGS=' + str(sys.flags))
+          print('ENABLE_USER_SITE=' + str(site.ENABLE_USER_SITE))
+          assert pathlib.Path(airlock.__file__).resolve() == trusted / 'src/airlock/__init__.py'
+          assert pathlib.Path(airlock.cli.__file__).resolve() == trusted / 'src/airlock/cli.py'
+          assert sys.flags.isolated == 1 and sys.flags.ignore_environment == 1
+          assert sys.flags.safe_path and sys.flags.no_user_site == 1
+          assert site.ENABLE_USER_SITE is False
+          assert '' not in sys.path
+          assert str(cwd) not in sys.path and str(cwd / 'src') not in sys.path
+          for name, module in tuple(sys.modules.items()):
+              origin = getattr(module, '__file__', None)
+              if origin:
+                  assert not pathlib.Path(origin).resolve().is_relative_to(cwd), (name, origin)
+          print('DIAGNOSTIC_ASSERTIONS=passed')
+          PY
+          status=0
+          python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from airlock.cli import main; raise SystemExit(main())' "$GITHUB_ACTION_PATH/src" scan --mode full --format console . > "$evidence/full.stdout" 2> "$evidence/full.stderr" || status=$?
+          printf '%s\n' "$status" > "$evidence/full.exit"
+          test "$status" -eq 0
+
+      - name: Run exact sketch with real pull_request base
+        if: github.event_name == 'pull_request'
+        working-directory: scanned
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/scanned/src:${{ github.workspace }}/scanned
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/isolation-evidence"
+          test -n "$PROBE_BASE"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          git cat-file -e "$PROBE_BASE^{commit}"
+          status=0
+          python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from airlock.cli import main; raise SystemExit(main())' "$GITHUB_ACTION_PATH/src" scan --event "$PROBE_EVENT" --base "$PROBE_BASE" --format console . > "$evidence/pr.stdout" 2> "$evidence/pr.stderr" || status=$?
+          printf '%s\n' "$status" > "$evidence/pr.exit"
+          test "$status" -eq 0
+
+      - name: Assert shallow base fails closed with exit 2
+        if: github.event_name == 'pull_request'
+        working-directory: shallow
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/shallow/src:${{ github.workspace }}/shallow
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/isolation-evidence"
+          test "$(git rev-parse --is-shallow-repository)" = true
+          test "$(git rev-list --count HEAD)" = 1
+          if git cat-file -e "$PROBE_BASE^{commit}" 2> "$evidence/base-lookup.stderr"; then
+            exit 1
+          fi
+          status=0
+          python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from airlock.cli import main; raise SystemExit(main())' "$GITHUB_ACTION_PATH/src" scan --event "$PROBE_EVENT" --base "$PROBE_BASE" --format console . > "$evidence/shallow.stdout" 2> "$evidence/shallow.stderr" || status=$?
+          printf '%s\n' "$status" > "$evidence/shallow.exit"
+          test "$status" -eq 2
+          test "$(git rev-list --count HEAD)" = 1
+          if git cat-file -e "$PROBE_BASE^{commit}" 2>/dev/null; then
+            exit 1
+          fi
+
+      - name: Publish captured output and assert no shadow execution
+        if: always()
+        shell: bash
+        run: |
+          python3 -I - <<'PY'
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'isolation-evidence'
+          marker = 'AIRLOCK_' + 'SHADOW_' + 'EXECUTED'
+          cases = ['full']
+          if os.environ['PROBE_EVENT'] == 'pull_request':
+              cases += ['pr', 'shallow']
+          required = ['diagnostic.stdout', 'diagnostic.stderr']
+          for case in cases:
+              required += [case + suffix for suffix in ('.stdout', '.stderr', '.exit')]
+          for path in sorted(evidence.glob('*')):
+              if path.is_file():
+                  text = path.read_text()
+                  print('--- ' + path.name + ' ---')
+                  print(text, end='' if text.endswith('\n') else '\n')
+                  assert marker not in text, 'Shadow marker appeared in captured output'
+          assert not (evidence / 'shadow-executed').exists(), 'Shadow code executed'
+          assert all((evidence / name).is_file() for name in required), 'Incomplete evidence'
+          assert 'DIAGNOSTIC_ASSERTIONS=passed' in (evidence / 'diagnostic.stdout').read_text()
+          assert '0 HIGH' in (evidence / 'full.stdout').read_text()
+          for case in cases:
+              expected = 2 if case == 'shallow' else 0
+              actual = int((evidence / (case + '.exit')).read_text())
+              assert actual == expected, (case, actual, expected)
+              print(f'ASSERTED_EXIT {case}={actual}')
+          if 'shallow' in cases:
+              error = (evidence / 'shallow.stderr').read_text()
+              assert 'is not reachable in this checkout' in error
+              assert 'fetch-depth: 0' in error
+              assert not (evidence / 'shallow.stdout').read_text()
+          print('SHADOW_MARKER_ABSENT=true')
+          print('SHADOW_SENTINEL_ABSENT=true')
+          print('ALL_REQUESTED_CASES_PASSED=true')
+          PY
