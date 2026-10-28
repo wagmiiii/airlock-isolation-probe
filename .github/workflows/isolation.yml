@@ -122,7 +122,8 @@ jobs:
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/isolation-evidence"
-          python3 -I - "$GITHUB_ACTION_PATH/src" <<'PY' > "$evidence/diagnostic.stdout" 2> "$evidence/diagnostic.stderr"
+          # -c matches the scanner launch and has no synthetic <stdin> file origin.
+          python3 -I -c "
           import sys
           sys.path.insert(0, sys.argv.pop(1))
           import airlock
@@ -152,7 +153,7 @@ jobs:
               if origin:
                   assert not pathlib.Path(origin).resolve().is_relative_to(cwd), (name, origin)
           print('DIAGNOSTIC_ASSERTIONS=passed')
-          PY
+          " "$GITHUB_ACTION_PATH/src" > "$evidence/diagnostic.stdout" 2> "$evidence/diagnostic.stderr"
           status=0
           python3 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from airlock.cli import main; raise SystemExit(main())' "$GITHUB_ACTION_PATH/src" scan --mode full --format console . > "$evidence/full.stdout" 2> "$evidence/full.stderr" || status=$?
           printf '%s\n' "$status" > "$evidence/full.exit"
