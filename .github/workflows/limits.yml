@@ -1,0 +1,65 @@
+# External measurement for airlock-sec/airlock#21, roadmap task 0.9.
+# Trusted inline harness. It emits workflow commands and step summaries of known size,
+# then the annotation counts are read back from the Checks API after the run.
+name: Reporter limits probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - limits-probe
+
+permissions:
+  contents: read
+
+jobs:
+  limits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EVENT_BEFORE: ${{ github.event.before }}
+      HEAD_SHA: ${{ github.sha }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Report the push event base fields
+        run: |
+          echo "event_name=${GITHUB_EVENT_NAME}"
+          echo "before=${EVENT_BEFORE}"
+          echo "sha=${HEAD_SHA}"
+          echo "ref=${REF_NAME}"
+
+      - name: Emit more annotations than the documented per-step limit
+        run: |
+          for i in $(seq 1 60); do
+            echo "::error file=README.md,line=1,title=probe-error-${i}::error probe ${i}"
+          done
+          for i in $(seq 1 30); do
+            echo "::warning file=README.md,line=1,title=probe-warning-${i}::warning probe ${i}"
+          done
+          for i in $(seq 1 25); do
+            echo "::notice file=README.md,line=1,title=probe-notice-${i}::notice probe ${i}"
+          done
+          echo "EMITTED errors=60 warnings=30 notices=25"
+
+      - name: Write a step summary just under 1 MiB
+        run: |
+          python3 - <<'PY'
+          import os
+          path = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(path, "w") as handle:
+              handle.write("a" * 1_048_000)
+          print("UNDER_LIMIT_BYTES=%d" % os.path.getsize(path))
+          PY
+
+      - name: Write a step summary one byte over 1 MiB
+        run: |
+          python3 - <<'PY'
+          import os
+          path = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(path, "w") as handle:
+              handle.write("b" * 1_048_577)
+          print("OVER_LIMIT_BYTES=%d" % os.path.getsize(path))
+          PY
+
+      - name: Finish after the oversize summary step
+        run: echo "PROBE_REACHED_END=1"
