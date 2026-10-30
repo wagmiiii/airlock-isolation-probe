@@ -50,6 +50,28 @@ jobs:
           done
           echo "EMITTED_SECOND=12"
 
+      - name: Check out with the default depth
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test whether the event base is reachable in that checkout
+        run: |
+          echo "depth=$(git rev-list --count HEAD)"
+          if git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            echo "BASE_REACHABLE_DEFAULT_DEPTH=yes"
+          else
+            echo "BASE_REACHABLE_DEFAULT_DEPTH=no"
+          fi
+
+      - name: Fetch the whole history and test again
+        run: |
+          git fetch --unshallow origin 2>/dev/null || git fetch --deepen=50 origin 2>/dev/null || true
+          echo "after_full_fetch_depth=$(git rev-list --count HEAD)"
+          if git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            echo "BASE_REACHABLE_FULL_HISTORY=yes"
+          else
+            echo "BASE_REACHABLE_FULL_HISTORY=no"
+          fi
+
   summaries:
     runs-on: ubuntu-latest
     timeout-minutes: 5
