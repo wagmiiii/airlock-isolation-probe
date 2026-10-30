@@ -1,6 +1,8 @@
 # External measurement for airlock-sec/airlock#21, roadmap task 0.9.
 # Trusted inline harness. It emits workflow commands and step summaries of known size,
-# then the annotation counts are read back from the Checks API after the run.
+# then the annotation counts are read back from the Checks API after the job completes.
+# The two jobs are independent on purpose: the summary job is the one expected to behave
+# badly near the documented 1 MiB ceiling, and that must not hide the annotation counts.
 name: Reporter limits probe
 
 on:
@@ -13,9 +15,9 @@ permissions:
   contents: read
 
 jobs:
-  limits:
+  annotations:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     env:
       EVENT_BEFORE: ${{ github.event.before }}
       HEAD_SHA: ${{ github.sha }}
@@ -41,14 +43,25 @@ jobs:
           done
           echo "EMITTED errors=60 warnings=30 notices=25"
 
-      - name: Write a step summary just under 1 MiB
+      - name: Emit the same levels from a second step
+        run: |
+          for i in $(seq 1 12); do
+            echo "::error file=README.md,line=2,title=second-error-${i}::second error ${i}"
+          done
+          echo "EMITTED_SECOND=12"
+
+  summaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write a small step summary
         run: |
           python3 - <<'PY'
           import os
           path = os.environ["GITHUB_STEP_SUMMARY"]
           with open(path, "w") as handle:
-              handle.write("a" * 1_048_000)
-          print("UNDER_LIMIT_BYTES=%d" % os.path.getsize(path))
+              handle.write("a" * 65_536)
+          print("SMALL_SUMMARY_BYTES=%d" % os.path.getsize(path))
           PY
 
       - name: Write a step summary one byte over 1 MiB
