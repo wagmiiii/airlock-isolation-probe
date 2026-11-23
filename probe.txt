@@ -1,0 +1,2 @@
+Benign pull-request change for the Airlock isolated Python launch probe.
+The scan target is data only. Do not execute its generated shadow modules.
